@@ -1,0 +1,47 @@
+[package]
+name = "rventoy"
+version = "0.7.0"
+edition = "2024"
+description = "rVentoy - Declarative WinUI 3 Desktop App and Core Library in Rust"
+license = "GPL-3.0-only"
+default-run = "rventoy"
+
+[lib]
+name = "VentoyCore"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rventoy"
+path = "src/main_window.rs"
+
+[dependencies]
+fatfs = "0.3"
+lzma-rs = "0.3"
+crc32fast = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+windows-reactor = "0.100"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+] }
+
+[build-dependencies]
+windows-reactor-setup = "0.100"
+winres = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
