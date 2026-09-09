@@ -43,7 +43,7 @@
 
 1. Clone the repository:
 ```bash
-git clone [https://github.com/mmdparsa-dev/rVentoy.git](https://github.com/mmdparsa-dev/rVentoy.git)
+git clone https://github.com/mmdparsa-dev/rVentoy.git
 cd rVentoy
 
 ```
