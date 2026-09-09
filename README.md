@@ -1,4 +1,11 @@
-# rVentoy 🚀
+<div align="center">
+
+# rVentoy
+![WinUI 3](https://img.shields.io/badge/UI-WinUI%203-blue?style=flat)
+![Rust](https://img.shields.io/badge/Rust-100%25-orange?style=flat)
+![Reactor](https://img.shields.io/badge/Windows%20Reactor-for%20Rust-purple?style=flat)
+![License](https://img.shields.io/badge/License-GPL-green?style=flat)
+</div>
 
 **rVentoy** is a modern and reliable Rust-based rewrite of the Ventoy disk installer with a native WinUI 3 interface.
 
