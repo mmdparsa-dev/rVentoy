@@ -2,13 +2,21 @@
 <img width="200" alt="logo" src="https://github.com/user-attachments/assets/bab844a7-ac04-4f72-8838-c543073562ba" />
 
 # rVentoy
-![WinUI 3](https://img.shields.io/badge/UI-WinUI%203-blue?style=flat)
-![Rust](https://img.shields.io/badge/Rust-100%25-orange?style=flat)
-![Reactor](https://img.shields.io/badge/Windows%20Reactor-for%20Rust-purple?style=flat)
-![License](https://img.shields.io/badge/License-GPL-green?style=flat)
-</div>
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/mmdparsa-dev/rVentoy/actions)
+[![Rust](https://img.shields.io/badge/Rust-100%25-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![WinUI 3](https://img.shields.io/badge/UI-WinUI%203%20%7C%20WASDK-0078D4?style=for-the-badge&logo=windows11&logoColor=white)](https://learn.microsoft.com/en-us/windows/apps/winui/winui3/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-00ADEF?style=for-the-badge&logo=windows&logoColor=white)](https://microsoft.com/windows)
+[![Target](https://img.shields.io/badge/Target-x86__64-informational?style=for-the-badge&logo=intel&logoColor=white)](https://github.com/mmdparsa-dev/rVentoy)
+[![Ventoy Core](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmmdparsa-dev%2FrVentoy%2Fmain%2Fventoy%2Fversion&search=(.*)&label=Ventoy%20Core&color=5C6BC0&style=for-the-badge&logo=usb&logoColor=white)](https://github.com/ventoy/Ventoy)
+[![Reactor](https://img.shields.io/badge/Windows%20Reactor-For%20Rust-7B1FA2?style=for-the-badge&logo=speedtest&logoColor=white)](https://github.com/mmdparsa-dev/rVentoy)
+[![Privileges](https://img.shields.io/badge/Privileges-Administrator%20Required-critical?style=for-the-badge&logo=windows-terminal&logoColor=white)](https://github.com/mmdparsa-dev/rVentoy)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-success?style=for-the-badge&logo=gnu&logoColor=white)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/mmdparsa-dev/rVentoy?style=for-the-badge&logo=github&color=2bbc8a)](https://github.com/mmdparsa-dev/rVentoy/releases)
+[![Issues](https://img.shields.io/github/issues/mmdparsa-dev/rVentoy?style=for-the-badge&logo=github)](https://github.com/mmdparsa-dev/rVentoy/issues)
+[![Stars](https://img.shields.io/github/stars/mmdparsa-dev/rVentoy?style=for-the-badge&logo=github)](https://github.com/mmdparsa-dev/rVentoy/stargazers)
 
 **rVentoy** is a modern and reliable Rust-based rewrite of the Ventoy disk installer with a native WinUI 3 interface.
+</div>
 
 ---
 
