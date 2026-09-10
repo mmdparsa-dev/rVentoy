@@ -1,4 +1,5 @@
 <div align="center">
+<img width="200" alt="logo" src="https://github.com/user-attachments/assets/bab844a7-ac04-4f72-8838-c543073562ba" />
 
 # rVentoy
 ![WinUI 3](https://img.shields.io/badge/UI-WinUI%203-blue?style=flat)
