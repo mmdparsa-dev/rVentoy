@@ -68,7 +68,6 @@ cargo build --release
 3. The generated executable will be available at:
 ```text
 target/release/rventoy.exe
-
 ```
 
 
