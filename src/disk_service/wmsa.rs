@@ -8,16 +8,26 @@ pub fn run_powershell_command(cmd: &str) -> bool {
     let ps_exe = format!("{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", windir);
 
     crate::ventoy_log!("Running powershell: {}", cmd);
-    let status = Command::new(ps_exe)
+    let output = Command::new(ps_exe)
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(cmd)
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
+        .output();
 
-    match status {
-        Ok(s) => s.success(),
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stdout.trim().is_empty() {
+                crate::ventoy_log!("powershell stdout:\n{}", stdout.trim());
+            }
+            if !stderr.trim().is_empty() {
+                crate::ventoy_log!("powershell stderr:\n{}", stderr.trim());
+            }
+            out.status.success()
+        }
         Err(e) => {
             crate::ventoy_log!("Failed to execute powershell: {}", e);
             false
@@ -59,7 +69,7 @@ pub fn format_volume(drive_letter: char, fs_name: &str, cluster_size: u32) -> bo
 
 pub fn format_disk_partition(disk_number: u32, partition_number: u32, fs_name: &str, cluster_size: u32) -> bool {
     let mut cmd = format!(
-        "Get-Partition -DiskNumber {} -PartitionNumber {} | Format-Volume -FileSystem {} -NewFileSystemLabel 'Ventoy' -Confirm:$false",
+        "Update-HostStorageCache; Start-Sleep -Milliseconds 500; Get-Partition -DiskNumber {} -PartitionNumber {} | Format-Volume -FileSystem {} -NewFileSystemLabel 'Ventoy' -Confirm:$false",
         disk_number, partition_number, fs_name
     );
     if cluster_size > 0 {

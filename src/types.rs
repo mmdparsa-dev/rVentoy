@@ -580,6 +580,7 @@ impl Default for VTOY_EXTERNAL_DRIVE {
     }
 }
 
+pub type ProgressCallback<'a> = &'a dyn Fn(i32, &str);
 pub type ProgressCallbackFunc = fn(percent: i32, status: &str);
 
 #[cfg(test)]

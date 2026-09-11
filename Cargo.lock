@@ -258,7 +258,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rventoy"
-version = "0.7.0"
+version = "0.7.7"
 dependencies = [
  "crc32fast",
  "fatfs",

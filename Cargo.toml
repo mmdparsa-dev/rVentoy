@@ -1,6 +1,6 @@
 [package]
 name = "rventoy"
-version = "0.7.0"
+version = "0.7.4"
 edition = "2024"
 description = "rVentoy - Declarative WinUI 3 Desktop App and Core Library in Rust"
 license = "GPL-3.0-only"
@@ -33,6 +33,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_Memory",
     "Win32_System_SystemServices",
+    "Win32_System_IO",
 ] }
 
 [build-dependencies]
