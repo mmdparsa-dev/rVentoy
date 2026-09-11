@@ -1,13 +1,18 @@
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, unused)]
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::os::raw::{c_char, c_int, c_void};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::*;
+use windows_sys::Win32::System::Threading::*;
 
 use crate::crc32::crc32;
 use crate::disk_service::*;
@@ -18,177 +23,335 @@ use crate::utility::*;
 use crate::ventoy_log;
 use crate::xz;
 
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn DeviceIoControl(
-        hDevice: HANDLE,
-        dwIoControlCode: u32,
-        lpInBuffer: *const c_void,
-        nInBufferSize: u32,
-        lpOutBuffer: *mut c_void,
-        nOutBufferSize: u32,
-        lpBytesReturned: *mut u32,
-        lpOverlapped: *mut c_void,
-    ) -> bool;
-
-    fn WriteFile(
-        hFile: HANDLE,
-        lpBuffer: *const c_void,
-        nNumberOfBytesToWrite: u32,
-        lpNumberOfBytesWritten: *mut u32,
-        lpOverlapped: *mut c_void,
-    ) -> bool;
-
-    fn ReadFile(
-        hFile: HANDLE,
-        lpBuffer: *mut c_void,
-        nNumberOfBytesToRead: u32,
-        lpNumberOfBytesRead: *mut u32,
-        lpOverlapped: *mut c_void,
-    ) -> bool;
-
-    fn SetFilePointerEx(
-        hFile: HANDLE,
-        liDistanceToMove: i64,
-        lpNewFilePointer: *mut i64,
-        dwMoveMethod: u32,
-    ) -> bool;
-}
-
-#[link(name = "advapi32")]
-unsafe extern "system" {
-    fn SystemFunction036(random_buffer: *mut c_void, random_buffer_length: u32) -> u8;
-}
-
-/// Safe RAII wrapper around a Win32 physical drive HANDLE.
-/// Ensures CloseHandle is deterministically called when dropped.
-pub struct PhysicalDriveHandle(HANDLE);
-
-impl Drop for PhysicalDriveHandle {
-    fn drop(&mut self) {
-        if self.0 != INVALID_HANDLE_VALUE && !self.0.is_null() {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
+pub struct PhysicalDriveHandle {
+    pub file: File,
 }
 
 impl PhysicalDriveHandle {
     #[inline]
     pub fn raw(&self) -> HANDLE {
-        self.0
+        self.file.as_raw_handle() as HANDLE
+    }
+
+    pub fn ioctl(
+        &self,
+        code: u32,
+        in_buf: Option<&[u8]>,
+        out_buf: Option<&mut [u8]>,
+    ) -> bool {
+        let (in_ptr, in_size) = match in_buf {
+            Some(b) => (b.as_ptr() as *const c_void, b.len() as u32),
+            None => (std::ptr::null(), 0),
+        };
+        let (out_ptr, out_size) = match out_buf {
+            Some(b) => (b.as_mut_ptr() as *mut c_void, b.len() as u32),
+            None => (std::ptr::null_mut(), 0),
+        };
+        let mut bytes_ret: u32 = 0;
+        unsafe {
+            DeviceIoControl(
+                self.raw(),
+                code,
+                in_ptr,
+                in_size,
+                out_ptr,
+                out_size,
+                &mut bytes_ret,
+                std::ptr::null_mut(),
+            ) != 0
+        }
+    }
+
+    pub fn lock(&self) -> bool {
+        const FSCTL_ALLOW_EXTENDED_DASD_IO: u32 = 0x00090083;
+        const FSCTL_LOCK_VOLUME: u32 = 0x00090018;
+        const FSCTL_DISMOUNT_VOLUME: u32 = 0x00090020;
+
+        self.ioctl(FSCTL_ALLOW_EXTENDED_DASD_IO, None, None);
+        self.ioctl(FSCTL_LOCK_VOLUME, None, None);
+        self.ioctl(FSCTL_DISMOUNT_VOLUME, None, None);
+        true
+    }
+
+    pub fn unlock(&self) {
+        const FSCTL_UNLOCK_VOLUME: u32 = 0x0009001C;
+        const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
+
+        let _ = (&self.file).flush();
+        self.ioctl(FSCTL_UNLOCK_VOLUME, None, None);
+        self.ioctl(IOCTL_DISK_UPDATE_PROPERTIES, None, None);
+    }
+
+    pub fn get_drive_size(&self) -> u64 {
+        let mut length_info = GET_LENGTH_INFORMATION { Length: 0 };
+        let mut bytes_ret: u32 = 0;
+        let ret = unsafe {
+            DeviceIoControl(
+                self.raw(),
+                IOCTL_DISK_GET_LENGTH_INFO,
+                std::ptr::null(),
+                0,
+                &mut length_info as *mut _ as *mut c_void,
+                size_of::<GET_LENGTH_INFORMATION>() as u32,
+                &mut bytes_ret,
+                std::ptr::null_mut(),
+            ) != 0
+        };
+        if ret && length_info.Length > 0 {
+            return length_info.Length as u64;
+        }
+
+        let mut geom_ex = DISK_GEOMETRY_EX {
+            Geometry: DISK_GEOMETRY {
+                Cylinders: 0,
+                MediaType: 0,
+                TracksPerCylinder: 0,
+                SectorsPerTrack: 0,
+                BytesPerSector: 0,
+            },
+            DiskSize: 0,
+            Data: [0],
+        };
+        let ret_geom = unsafe {
+            DeviceIoControl(
+                self.raw(),
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                std::ptr::null(),
+                0,
+                &mut geom_ex as *mut _ as *mut c_void,
+                size_of::<DISK_GEOMETRY_EX>() as u32,
+                &mut bytes_ret,
+                std::ptr::null_mut(),
+            ) != 0
+        };
+        if ret_geom && geom_ex.DiskSize > 0 {
+            return geom_ex.DiskSize as u64;
+        }
+        0
+    }
+
+    pub fn query_device_descriptor(&self, buf: &mut [u8]) -> bool {
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut bytes_ret: u32 = 0;
+        unsafe {
+            DeviceIoControl(
+                self.raw(),
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                &query as *const _ as *const c_void,
+                size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut bytes_ret,
+                std::ptr::null_mut(),
+            ) != 0
+        }
     }
 }
 
 pub fn open_physical_drive(phy_drive: i32, write_access: bool) -> Option<PhysicalDriveHandle> {
-    let path = format!("\\\\.\\PhysicalDrive{}\0", phy_drive);
-    let access = if write_access {
-        GENERIC_READ | GENERIC_WRITE
-    } else {
-        GENERIC_READ
-    };
+    let path = format!(r"\\.\PhysicalDrive{}", phy_drive);
     let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
-    let handle = unsafe {
-        CreateFileA(
-            path.as_ptr(),
-            access,
-            share,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
+    if write_access {
+        let flags = FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH;
+        if let Ok(file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(share)
+            .custom_flags(flags)
+            .open(&path)
+        {
+            return Some(PhysicalDriveHandle { file });
+        }
+
+        if let Ok(file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(share)
+            .open(&path)
+        {
+            return Some(PhysicalDriveHandle { file });
+        }
+    } else {
+        if let Ok(file) = OpenOptions::new()
+            .read(true)
+            .share_mode(share)
+            .open(&path)
+        {
+            return Some(PhysicalDriveHandle { file });
+        }
+    }
+
+    None
+}
+
+#[repr(C)]
+struct DISK_EXTENT {
+    DiskNumber: u32,
+    StartingOffset: i64,
+    ExtentLength: i64,
+}
+
+#[repr(C)]
+struct VOLUME_DISK_EXTENTS {
+    NumberOfDiskExtents: u32,
+    Extents: [DISK_EXTENT; 1],
+}
+
+pub fn get_system_drive_disk_number() -> Option<u32> {
+    let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let path = format!(r"\\.\{}", sys_drive);
+    let file = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .ok()?;
+
+    const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x00560000;
+    let mut extents = VOLUME_DISK_EXTENTS {
+        NumberOfDiskExtents: 0,
+        Extents: [DISK_EXTENT {
+            DiskNumber: 0,
+            StartingOffset: 0,
+            ExtentLength: 0,
+        }],
+    };
+    let mut bytes_ret: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            std::ptr::null(),
             0,
-            0 as HANDLE,
+            &mut extents as *mut _ as *mut c_void,
+            size_of::<VOLUME_DISK_EXTENTS>() as u32,
+            &mut bytes_ret,
+            std::ptr::null_mut(),
+        ) != 0
+    };
+    if ok && extents.NumberOfDiskExtents > 0 {
+        Some(extents.Extents[0].DiskNumber)
+    } else {
+        None
+    }
+}
+
+pub fn is_system_drive(phy_drive: i32) -> bool {
+    if let Some(sys_disk) = get_system_drive_disk_number() {
+        phy_drive as u32 == sys_disk
+    } else {
+        false
+    }
+}
+
+pub fn is_elevated() -> bool {
+    let mut token: HANDLE = std::ptr::null_mut();
+    let open_ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if open_ok == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut ret_len: u32 = 0;
+    let res = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
         )
     };
-
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        None
-    } else {
-        Some(PhysicalDriveHandle(handle))
-    }
+    unsafe { CloseHandle(token) };
+    res != 0 && elevation.TokenIsElevated != 0
 }
 
 pub fn generate_random_guid() -> [u8; 16] {
     let mut guid = [0u8; 16];
-    unsafe {
-        if SystemFunction036(guid.as_mut_ptr() as *mut _, 16) == 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let b = now.to_le_bytes();
-            guid[..16].copy_from_slice(&b[..16]);
-        }
-    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let b = now.to_le_bytes();
+    guid.copy_from_slice(&b);
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let top = u64::from_le_bytes(guid[0..8].try_into().unwrap_or_default()) ^ c;
+    guid[0..8].copy_from_slice(&top.to_le_bytes());
+
     guid[6] = (guid[6] & 0x0F) | 0x40;
     guid[8] = (guid[8] & 0x3F) | 0x80;
     guid
 }
 
-pub fn write_data_to_phy_disk(handle: &PhysicalDriveHandle, mut offset: u64, buffer: &[u8]) -> bool {
-    const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB chunks
+pub fn write_data_to_phy_disk_with_progress<F>(
+    handle: &PhysicalDriveHandle,
+    mut offset: u64,
+    buffer: &[u8],
+    mut progress: F,
+) -> bool
+where
+    F: FnMut(usize, usize),
+{
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    let mut raw_buf = vec![0u8; CHUNK_SIZE + 4096];
+    let addr = raw_buf.as_ptr() as usize;
+    let align_offset = (4096 - (addr % 4096)) % 4096;
+
+    let total = buffer.len();
+    let mut written = 0;
     for chunk in buffer.chunks(CHUNK_SIZE) {
-        let mut new_pos: i64 = 0;
-        let set_res = unsafe {
-            SetFilePointerEx(handle.raw(), offset as i64, &mut new_pos, FILE_BEGIN)
-        };
-        if !set_res || new_pos != offset as i64 {
-            ventoy_log!("SetFilePointerEx failed at offset {}", offset);
+        let chunk_len = chunk.len();
+        let aligned_slice = &mut raw_buf[align_offset..align_offset + CHUNK_SIZE];
+        aligned_slice[..chunk_len].copy_from_slice(chunk);
+        let write_len = ((chunk_len + 511) / 512) * 512;
+        if write_len > chunk_len {
+            aligned_slice[chunk_len..write_len].fill(0);
+        }
+
+        if (&handle.file).seek(SeekFrom::Start(offset)).is_err() {
+            ventoy_log!("Seek failed at offset {}", offset);
             return false;
         }
 
-        let mut bytes_written: u32 = 0;
-        let ret = unsafe {
-            WriteFile(
-                handle.raw(),
-                chunk.as_ptr() as *const c_void,
-                chunk.len() as u32,
-                &mut bytes_written,
-                std::ptr::null_mut(),
-            )
-        };
-
-        if !ret || (bytes_written as usize) != chunk.len() {
-            ventoy_log!(
-                "WriteFile failed at offset {}: written {} of {}",
-                offset,
-                bytes_written,
-                chunk.len()
-            );
+        if (&handle.file).write_all(&aligned_slice[..write_len]).is_err() {
+            ventoy_log!("write_all failed at offset {}", offset);
             return false;
         }
-        offset += chunk.len() as u64;
+
+        offset += chunk_len as u64;
+        written += chunk_len;
+        progress(written, total);
     }
     true
 }
 
+pub fn write_data_to_phy_disk(handle: &PhysicalDriveHandle, offset: u64, buffer: &[u8]) -> bool {
+    write_data_to_phy_disk_with_progress(handle, offset, buffer, |_, _| {})
+}
+
 pub fn read_data_from_phy_disk(handle: &PhysicalDriveHandle, mut offset: u64, buffer: &mut [u8]) -> bool {
-    const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB chunks
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    let mut raw_buf = vec![0u8; CHUNK_SIZE + 4096];
+    let addr = raw_buf.as_ptr() as usize;
+    let align_offset = (4096 - (addr % 4096)) % 4096;
+
     for chunk in buffer.chunks_mut(CHUNK_SIZE) {
-        let mut new_pos: i64 = 0;
-        let set_res = unsafe {
-            SetFilePointerEx(handle.raw(), offset as i64, &mut new_pos, FILE_BEGIN)
-        };
-        if !set_res || new_pos != offset as i64 {
+        let chunk_len = chunk.len();
+        let read_len = ((chunk_len + 511) / 512) * 512;
+        if (&handle.file).seek(SeekFrom::Start(offset)).is_err() {
             return false;
         }
-
-        let mut bytes_read: u32 = 0;
-        let ret = unsafe {
-            ReadFile(
-                handle.raw(),
-                chunk.as_mut_ptr() as *mut c_void,
-                chunk.len() as u32,
-                &mut bytes_read,
-                std::ptr::null_mut(),
-            )
-        };
-
-        if !ret || (bytes_read as usize) != chunk.len() {
+        let aligned_slice = &mut raw_buf[align_offset..align_offset + read_len];
+        if (&handle.file).read_exact(aligned_slice).is_err() {
             return false;
         }
-        offset += chunk.len() as u64;
+        chunk.copy_from_slice(&aligned_slice[..chunk_len]);
+        offset += chunk_len as u64;
     }
     true
 }
@@ -347,70 +510,13 @@ pub fn scan_all_physical_drives() -> Vec<PHY_DRIVE_INFO> {
             None => continue,
         };
 
-        let mut length_info = GET_LENGTH_INFORMATION { Length: 0 };
-        let mut bytes_ret: u32 = 0;
-        let ret = unsafe {
-            DeviceIoControl(
-                handle.raw(),
-                IOCTL_DISK_GET_LENGTH_INFO,
-                std::ptr::null(),
-                0,
-                &mut length_info as *mut _ as *mut c_void,
-                size_of::<GET_LENGTH_INFORMATION>() as u32,
-                &mut bytes_ret,
-                std::ptr::null_mut(),
-            )
-        };
-
-        let mut size_in_bytes = if ret {
-            length_info.Length as u64
-        } else {
-            0
-        };
-
-        if size_in_bytes == 0 {
-            let mut geom_ex: DISK_GEOMETRY_EX = unsafe { std::mem::zeroed() };
-            let ret_geom = unsafe {
-                DeviceIoControl(
-                    handle.raw(),
-                    IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-                    std::ptr::null(),
-                    0,
-                    &mut geom_ex as *mut _ as *mut c_void,
-                    size_of::<DISK_GEOMETRY_EX>() as u32,
-                    &mut bytes_ret,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ret_geom {
-                size_in_bytes = geom_ex.DiskSize as u64;
-            }
-        }
-
+        let size_in_bytes = handle.get_drive_size();
         if size_in_bytes == 0 {
             continue;
         }
 
-        // Query storage property
-        let mut query = STORAGE_PROPERTY_QUERY {
-            PropertyId: StorageDeviceProperty,
-            QueryType: PropertyStandardQuery,
-            AdditionalParameters: [0],
-        };
         let mut desc_buf = vec![0u8; 1024];
-        let ret_query = unsafe {
-            DeviceIoControl(
-                handle.raw(),
-                IOCTL_STORAGE_QUERY_PROPERTY,
-                &mut query as *mut _ as *mut c_void,
-                size_of::<STORAGE_PROPERTY_QUERY>() as u32,
-                desc_buf.as_mut_ptr() as *mut c_void,
-                desc_buf.len() as u32,
-                &mut bytes_ret,
-                std::ptr::null_mut(),
-            )
-        };
-
+        let ret_query = handle.query_device_descriptor(&mut desc_buf);
         drop(handle);
 
         let mut drive_info = PHY_DRIVE_INFO::default();
@@ -420,11 +526,14 @@ pub fn scan_all_physical_drives() -> Vec<PHY_DRIVE_INFO> {
         drive_info.bytes_per_logical_sector = 512;
         drive_info.bytes_per_physical_sector = 512;
 
-        if ret_query && desc_buf.len() >= size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
-            let desc = unsafe {
-                std::ptr::read_unaligned(desc_buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR)
-            };
-            let bus_type_raw = desc.BusType as u32;
+        if ret_query && desc_buf.len() >= 32 {
+            let removable = desc_buf.get(10).copied().unwrap_or(0) != 0;
+            let vendor_offset = u32::from_le_bytes(desc_buf[12..16].try_into().unwrap_or_default());
+            let product_offset = u32::from_le_bytes(desc_buf[16..20].try_into().unwrap_or_default());
+            let revision_offset = u32::from_le_bytes(desc_buf[20..24].try_into().unwrap_or_default());
+            let serial_offset = u32::from_le_bytes(desc_buf[24..28].try_into().unwrap_or_default());
+            let bus_type_raw = u32::from_le_bytes(desc_buf[28..32].try_into().unwrap_or_default());
+
             drive_info.bus_type = match bus_type_raw {
                 7 => STORAGE_BUS_TYPE::BusTypeUsb,
                 1 => STORAGE_BUS_TYPE::BusTypeScsi,
@@ -435,7 +544,7 @@ pub fn scan_all_physical_drives() -> Vec<PHY_DRIVE_INFO> {
                 13 => STORAGE_BUS_TYPE::BusTypeMmc,
                 _ => STORAGE_BUS_TYPE::BusTypeUnknown,
             };
-            drive_info.removable_media = if desc.RemovableMedia { 1 } else { 0 };
+            drive_info.removable_media = if removable { 1 } else { 0 };
 
             let extract_str = |offset: u32, target: &mut [c_char]| {
                 if offset > 0 && (offset as usize) < desc_buf.len() {
@@ -452,10 +561,10 @@ pub fn scan_all_physical_drives() -> Vec<PHY_DRIVE_INFO> {
                 }
             };
 
-            extract_str(desc.VendorIdOffset, &mut drive_info.vendor_id);
-            extract_str(desc.ProductIdOffset, &mut drive_info.product_id);
-            extract_str(desc.ProductRevisionOffset, &mut drive_info.product_rev);
-            extract_str(desc.SerialNumberOffset, &mut drive_info.serial_number);
+            extract_str(vendor_offset, &mut drive_info.vendor_id);
+            extract_str(product_offset, &mut drive_info.product_id);
+            extract_str(revision_offset, &mut drive_info.product_rev);
+            extract_str(serial_offset, &mut drive_info.serial_number);
         }
 
         // Check if Ventoy is already on disk
@@ -582,11 +691,74 @@ pub fn ventoy_fill_gpt(disk_size_bytes: u64, gpt: &mut VTOY_GPT_INFO) {
     gpt.head.crc = crc32(&head_bytes);
 }
 
+static EFI_IMG_CACHE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+static CORE_IMG_CACHE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+pub fn preload_assets_in_background() {
+    std::thread::spawn(|| {
+        let _ = get_or_decompress_efi_image();
+        let _ = get_or_decompress_core_image();
+    });
+}
+
+pub fn get_or_decompress_efi_image() -> Option<Vec<u8>> {
+    if let Some(cached) = EFI_IMG_CACHE.get() {
+        return Some(cached.clone());
+    }
+
+    let raw_candidates = [
+        "ventoy/ventoy.disk.img",
+        "ventoy\\ventoy.disk.img",
+        "ventoy.disk.img",
+    ];
+    for cand in &raw_candidates {
+        if let Some(path) = find_asset_path(cand) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if bytes.len() >= 32 * 1024 * 1024 {
+                    let _ = EFI_IMG_CACHE.set(bytes.clone());
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+
+    let efi_xz_candidates = [
+        "ventoy/ventoy.disk.img.xz",
+        "ventoy\\ventoy.disk.img.xz",
+        "ventoy.disk.img.xz",
+    ];
+    for cand in &efi_xz_candidates {
+        if let Some(path) = find_asset_path(cand) {
+            if let Ok(bytes) = xz::decompress_xz_file(path.to_str().unwrap_or(cand)) {
+                let _ = EFI_IMG_CACHE.set(bytes.clone());
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
+pub fn get_or_decompress_core_image() -> Option<Vec<u8>> {
+    if let Some(cached) = CORE_IMG_CACHE.get() {
+        return Some(cached.clone());
+    }
+    let core_xz_candidates = ["boot/core.img.xz", "boot\\core.img.xz", "core.img.xz"];
+    for cand in &core_xz_candidates {
+        if let Some(path) = find_asset_path(cand) {
+            if let Ok(bytes) = xz::decompress_xz_file(path.to_str().unwrap_or(cand)) {
+                let _ = CORE_IMG_CACHE.set(bytes.clone());
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
 pub fn install_ventoy_to_phy_drive(
     drive: &PHY_DRIVE_INFO,
     part_style: i32,
     secure_boot: bool,
-    callback: Option<ProgressCallbackFunc>,
+    callback: Option<&dyn Fn(i32, &str)>,
 ) -> i32 {
     let phy_drive_id = drive.phy_drive;
     let size_bytes = drive.size_in_bytes;
@@ -598,34 +770,20 @@ pub fn install_ventoy_to_phy_drive(
         ventoy_log!("[{}%] {}", percent, status);
     };
 
+    // Safeguard: Never install to the active Windows system / boot drive
+    if is_system_drive(phy_drive_id) {
+        update_progress(0, "Error: Selected drive contains the active Windows installation (C:). Operation blocked for safety.");
+        return -10;
+    }
+
     update_progress(10, "Cleaning disk partitions...");
     if !disk_clean_disk(phy_drive_id as u32) {
         update_progress(10, "Failed to clean target disk partitions");
         return -2;
     }
 
-    update_progress(20, "Decompressing Ventoy EFI image with lzma-rs...");
-    let efi_xz_candidates = [
-        "ventoy/ventoy.disk.img.xz",
-        "ventoy\\ventoy.disk.img.xz",
-        "ventoy.disk.img.xz",
-    ];
-    let mut efi_img_bytes = None;
-    for cand in &efi_xz_candidates {
-        if let Some(path) = find_asset_path(cand) {
-            match xz::decompress_xz_file(path.to_str().unwrap_or(cand)) {
-                Ok(bytes) => {
-                    efi_img_bytes = Some(bytes);
-                    break;
-                }
-                Err(e) => {
-                    ventoy_log!("Failed to decompress {}: {}", cand, e);
-                }
-            }
-        }
-    }
-
-    let mut efi_data = match efi_img_bytes {
+    update_progress(20, "Loading Ventoy EFI image from memory...");
+    let mut efi_data = match get_or_decompress_efi_image() {
         Some(b) => b,
         None => {
             update_progress(25, "Error: Could not find or decompress ventoy.disk.img.xz");
@@ -634,20 +792,39 @@ pub fn install_ventoy_to_phy_drive(
     };
 
     if !secure_boot {
-        update_progress(30, "Configuring EFI filesystem (Secure Boot disabled)...");
+        update_progress(28, "Configuring EFI filesystem (Secure Boot disabled)...");
         let _ = fat_io::disable_secure_boot_in_image(&mut efi_data);
     } else {
-        update_progress(30, "Preserving signed Secure Boot EFI binaries...");
+        update_progress(28, "Preserving signed Secure Boot EFI binaries...");
     }
 
-    update_progress(40, "Opening disk for writing...");
+    update_progress(35, "Loading Ventoy MBR bootstrap code...");
+    let boot_img_candidates = ["boot/boot.img", "boot\\boot.img", "boot.img"];
+    let mut boot_img_bytes = None;
+    for cand in &boot_img_candidates {
+        if let Some(path) = find_asset_path(cand) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if bytes.len() >= 446 {
+                    boot_img_bytes = Some(bytes);
+                    break;
+                }
+            }
+        }
+    }
+
+    update_progress(40, "Loading Ventoy stage 1 core bootloader...");
+    let core_img_bytes = get_or_decompress_core_image();
+
+    update_progress(45, "Opening disk for writing...");
     let h_disk = match open_physical_drive(phy_drive_id, true) {
         Some(h) => h,
         None => {
-            update_progress(40, "Failed to open physical drive with write access");
+            update_progress(45, "Failed to open physical drive with write access");
             return -3;
         }
     };
+
+    h_disk.lock();
 
     let total_sectors = size_bytes / 512;
     let efi_sectors = 65536u64;
@@ -657,19 +834,28 @@ pub fn install_ventoy_to_phy_drive(
 
     update_progress(50, "Writing EFI partition to disk...");
     let efi_offset = part2_start_sector * 512;
-    if !write_data_to_phy_disk(&h_disk, efi_offset, &efi_data) {
+    let write_ok = write_data_to_phy_disk_with_progress(&h_disk, efi_offset, &efi_data, |written, total| {
+        let pct = 50 + ((written as f64 / total as f64) * 15.0) as i32;
+        let mb_written = written / (1024 * 1024);
+        let mb_total = total / (1024 * 1024);
+        update_progress(pct, &format!("Writing EFI partition ({} MB / {} MB)...", mb_written, mb_total));
+    });
+    if !write_ok {
         update_progress(50, "Failed to write EFI partition data");
         return -4;
     }
 
-    update_progress(70, "Writing partition tables...");
+    update_progress(65, "Writing partition tables and bootloader...");
     if part_style == 1 {
         // GPT
         let mut gpt = VTOY_GPT_INFO::default();
         ventoy_fill_gpt(size_bytes, &mut gpt);
+        if let Some(ref bc) = boot_img_bytes {
+            gpt.mbr.boot_code.copy_from_slice(&bc[..446]);
+        }
         let gpt_bytes = gpt.primary_to_bytes();
         if !write_data_to_phy_disk(&h_disk, 0, &gpt_bytes) {
-            update_progress(70, "Failed to write primary GPT partition table");
+            update_progress(65, "Failed to write primary GPT partition table");
             return -5;
         }
 
@@ -677,7 +863,7 @@ pub fn install_ventoy_to_phy_drive(
         let backup_part_tbl_offset = (gpt.head.efi_backup_lba - 32) * 512;
         let part_tbl_bytes = gpt.part_table_bytes();
         if !write_data_to_phy_disk(&h_disk, backup_part_tbl_offset, &part_tbl_bytes) {
-            update_progress(75, "Failed to write backup GPT partition array");
+            update_progress(70, "Failed to write backup GPT partition array");
             return -6;
         }
 
@@ -693,43 +879,49 @@ pub fn install_ventoy_to_phy_drive(
         let backup_offset = (gpt.head.efi_backup_lba * 512) as u64;
         let full_backup_bytes = backup_head.to_sector_bytes();
         if !write_data_to_phy_disk(&h_disk, backup_offset, &full_backup_bytes) {
-            update_progress(78, "Failed to write backup GPT header");
+            update_progress(75, "Failed to write backup GPT header");
             return -7;
         }
     } else {
         // MBR
         let mut mbr = MBR_HEAD::default();
         ventoy_fill_mbr(size_bytes, &mut mbr, part_style, 0x07);
+        if let Some(ref bc) = boot_img_bytes {
+            mbr.boot_code.copy_from_slice(&bc[..446]);
+        }
         let mbr_bytes = mbr.to_bytes();
         if !write_data_to_phy_disk(&h_disk, 0, &mbr_bytes) {
-            update_progress(70, "Failed to write MBR partition table");
+            update_progress(65, "Failed to write MBR partition table");
             return -5;
+        }
+
+        // Write stage 1 core.img starting at sector 1 (MBR gap, up to sector 2047)
+        if let Some(ref core_bytes) = core_img_bytes {
+            update_progress(72, "Writing Ventoy core bootloader to MBR gap...");
+            let max_core_len = ((part1_start - 1) * 512) as usize;
+            let write_len = core_bytes.len().min(max_core_len);
+            if !write_data_to_phy_disk(&h_disk, 512, &core_bytes[..write_len]) {
+                ventoy_log!("Warning: Failed to write core.img to MBR gap");
+            }
         }
     }
 
-    // Refresh disk layout
-    let mut bytes_ret: u32 = 0;
-    unsafe {
-        DeviceIoControl(
-            h_disk.raw(),
-            IOCTL_DISK_UPDATE_PROPERTIES,
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            0,
-            &mut bytes_ret,
-            std::ptr::null_mut(),
-        );
-    }
+    update_progress(85, "Formatting Ventoy data partition (exFAT)...");
+    let formatted_natively = crate::exfat::format_exfat_partition_native(
+        &h_disk,
+        part1_start,
+        part1_sectors,
+        "Ventoy",
+    );
+
+    h_disk.unlock();
     drop(h_disk);
 
-    // Allow Windows PNP and partition manager time to recognize new partition table
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-
-    update_progress(85, "Formatting Ventoy data partition (exFAT)...");
-    if !crate::disk_service::disk_format_partition(phy_drive_id as u32, 1, "exFAT", 0) {
-        update_progress(85, "Failed to format Ventoy data partition");
-        return -8;
+    if !formatted_natively {
+        if !crate::disk_service::disk_format_partition(phy_drive_id as u32, 1, "exFAT", 0) {
+            update_progress(85, "Failed to format Ventoy data partition");
+            return -8;
+        }
     }
 
     update_progress(100, "rVentoy installation completed successfully!");
@@ -738,7 +930,7 @@ pub fn install_ventoy_to_phy_drive(
 
 pub fn update_ventoy_to_phy_drive(
     drive: &PHY_DRIVE_INFO,
-    callback: Option<ProgressCallbackFunc>,
+    callback: Option<&dyn Fn(i32, &str)>,
 ) -> i32 {
     let phy_drive_id = drive.phy_drive;
     let size_bytes = drive.size_in_bytes;
@@ -749,6 +941,12 @@ pub fn update_ventoy_to_phy_drive(
         }
         ventoy_log!("[{}%] {}", percent, status);
     };
+
+    // Safeguard: Never update the active Windows system / boot drive
+    if is_system_drive(phy_drive_id) {
+        update_progress(0, "Error: Selected drive contains the active Windows installation (C:). Operation blocked for safety.");
+        return -10;
+    }
 
     update_progress(10, "Starting rVentoy update...");
     let mut mbr = MBR_HEAD::default();
@@ -765,23 +963,8 @@ pub fn update_ventoy_to_phy_drive(
         return -1;
     }
 
-    update_progress(30, "Decompressing new Ventoy EFI image with lzma-rs...");
-    let efi_xz_candidates = [
-        "ventoy/ventoy.disk.img.xz",
-        "ventoy\\ventoy.disk.img.xz",
-        "ventoy.disk.img.xz",
-    ];
-    let mut efi_data = None;
-    for cand in &efi_xz_candidates {
-        if let Some(path) = find_asset_path(cand) {
-            if let Ok(bytes) = xz::decompress_xz_file(path.to_str().unwrap_or(cand)) {
-                efi_data = Some(bytes);
-                break;
-            }
-        }
-    }
-
-    let mut efi_bytes = match efi_data {
+    update_progress(30, "Loading Ventoy EFI image from memory...");
+    let mut efi_bytes = match get_or_decompress_efi_image() {
         Some(b) => b,
         None => {
             update_progress(30, "Error: Could not find ventoy.disk.img.xz");
@@ -794,7 +977,7 @@ pub fn update_ventoy_to_phy_drive(
         let _ = fat_io::disable_secure_boot_in_image(&mut efi_bytes);
     }
 
-    update_progress(70, "Writing updated EFI partition to disk...");
+    update_progress(70, "Opening disk for writing...");
     let h_disk = match open_physical_drive(phy_drive_id, true) {
         Some(h) => h,
         None => {
@@ -803,28 +986,97 @@ pub fn update_ventoy_to_phy_drive(
         }
     };
 
+    h_disk.lock();
+
+    update_progress(80, "Writing updated EFI partition to disk...");
     let efi_offset = part2_start_sector * 512;
-    if !write_data_to_phy_disk(&h_disk, efi_offset, &efi_bytes) {
-        update_progress(70, "Failed to write EFI partition");
+    let write_ok = write_data_to_phy_disk_with_progress(&h_disk, efi_offset, &efi_bytes, |written, total| {
+        let pct = 80 + ((written as f64 / total as f64) * 15.0) as i32;
+        let mb_written = written / (1024 * 1024);
+        let mb_total = total / (1024 * 1024);
+        update_progress(pct, &format!("Writing EFI partition ({} MB / {} MB)...", mb_written, mb_total));
+    });
+    if !write_ok {
+        update_progress(80, "Failed to write EFI partition");
         return -4;
     }
 
-    let mut bytes_ret: u32 = 0;
-    unsafe {
-        DeviceIoControl(
-            h_disk.raw(),
-            IOCTL_DISK_UPDATE_PROPERTIES,
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            0,
-            &mut bytes_ret,
-            std::ptr::null_mut(),
-        );
-    }
+    h_disk.unlock();
     drop(h_disk);
 
     update_progress(100, "rVentoy update completed successfully!");
+    0
+}
+
+pub fn uninstall_ventoy_from_phy_drive(
+    drive: &PHY_DRIVE_INFO,
+    callback: Option<&dyn Fn(i32, &str)>,
+) -> i32 {
+    let phy_drive_id = drive.phy_drive;
+    let size_bytes = drive.size_in_bytes;
+
+    let update_progress = |percent: i32, status: &str| {
+        if let Some(cb) = callback {
+            cb(percent, status);
+        }
+        ventoy_log!("[{}%] {}", percent, status);
+    };
+
+    if is_system_drive(phy_drive_id) {
+        update_progress(0, "Error: Selected drive contains the active Windows installation (C:). Operation blocked for safety.");
+        return -10;
+    }
+
+    update_progress(10, "Opening physical drive and locking volume...");
+    if let Some(h_disk) = open_physical_drive(phy_drive_id, true) {
+        h_disk.lock();
+
+        update_progress(20, "Wiping Ventoy bootloader sectors...");
+        let zero_buf = vec![0u8; 1024 * 1024];
+        write_data_to_phy_disk(&h_disk, 0, &zero_buf);
+
+        if size_bytes > 1024 * 1024 {
+            let backup_offset = size_bytes.saturating_sub(1024 * 1024);
+            write_data_to_phy_disk(&h_disk, backup_offset, &zero_buf);
+        }
+
+        h_disk.unlock();
+        drop(h_disk);
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    update_progress(40, "Cleaning disk partitions with diskpart...");
+    let clean_script = format!("select disk {}\nclean\n", phy_drive_id);
+    let _ = crate::disk_service::diskpart::run_diskpart_script(&clean_script);
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    update_progress(60, "Creating standard primary partition...");
+    let part_script = format!(
+        "select disk {}\nconvert mbr\ncreate partition primary\nactive\n",
+        phy_drive_id
+    );
+    if !crate::disk_service::diskpart::run_diskpart_script(&part_script) {
+        update_progress(60, "Failed to create primary partition");
+        return -5;
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    update_progress(80, "Formatting USB drive (exFAT)...");
+    let format_script = format!(
+        "rescan\nselect disk {}\nselect partition 1\nformat fs=exfat quick label=\"USB DRIVE\"\nassign\n",
+        phy_drive_id
+    );
+    if !crate::disk_service::diskpart::run_diskpart_script(&format_script) {
+        if !crate::disk_service::disk_format_partition(phy_drive_id as u32, 1, "exFAT", 0) {
+            update_progress(80, "Failed to format partition");
+            return -8;
+        }
+    }
+
+    update_progress(100, "rVentoy uninstalled successfully! Drive restored as standard storage.");
     0
 }
 
@@ -914,6 +1166,16 @@ mod tests {
         assert_eq!(part1.fs_flag, 0xEF);
         assert_eq!(part1_sectors, 65536);
         assert_eq!(part1.active, 0x80);
+    }
+
+    #[test]
+    fn test_system_drive_detection() {
+        // Under Windows, C: drive usually maps to a valid disk number (e.g., Disk 0)
+        let disk_num = get_system_drive_disk_number();
+        assert!(disk_num.is_some(), "Should detect Windows system drive disk number");
+        let num = disk_num.unwrap();
+        assert!(is_system_drive(num as i32));
+        assert!(!is_system_drive((num + 999) as i32));
     }
 }
 
